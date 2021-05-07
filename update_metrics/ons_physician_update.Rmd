@@ -1,0 +1,332 @@
+---
+title: "ONS Physician Calculations"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(onsr)
+library(valhallr)
+library(leaflet)
+knitr::opts_chunk$set(echo = TRUE)#, message = FALSE, warning = FALSE)
+
+
+# NOTE: Function should maybe be added to valhallr
+########
+# function to take class sf shapefile/simple feature geometric object and
+# convert it to a tibble with lat and lon columns for valhallr
+sf_to_latlon <- function(data, output_crs = "WGS84"){
+  # input validation: make sure it's an sf object
+  if (!"sf" %in% class(data)) stop ("Input data is not a simple feature object with class sf.")
+  # make sure it doesn't already have lat/lon columns
+  if (("lat" %in% colnames(data)) | "lon" %in% colnames(data)) stop ("Input data already has columns named `lat` and/or `lon`.")
+  # make sure it's all point data
+  if (!(unique(sf::st_geometry_type(data)) == "POINT")) stop ("Input data is not exclusively point data.")
+  
+  .coords <- data %>%
+    sf::st_transform(crs = output_crs) %>%
+    sf::st_coordinates() %>%
+    tibble::as_tibble() %>%
+    dplyr::rename(lon = X, lat = Y)
+  
+  data %>%
+    sf::st_set_geometry(NULL) %>%
+    dplyr::bind_cols(.coords)
+  
+}
+```
+
+## Purpose
+
+This RMarkdown file includes code and instructions for calculating five Ottawa Neighbourhood Study (ONS) metrics related to neighbourhood-level access to family physicians (FPs). The metrics are:
+
+* \# FPs in each Neighbourhood
+* \# FPs / 1000 residents in the neighbourhood plus a 50m buffer
+* Average walking distance to 5 nearest FPs (measured from dissemination blocks (DBs) and population-weighted up to the neighbourhood level)
+* Average driving time to 5 nearest FPs (measured from DBs and population-weighted up to the neighbourhood level)
+* % of residents within a 15-minute walk of any FP
+
+
+## Loading the data
+
+NOTE: Right now we're using data that is still being validated by summer students. We'll need to re-run these calculations once we have the confirmed data.
+
+```{r, warning = FALSE, message = FALSE}
+ottawa_docs <- read_csv("../data/docs_fulldata.csv") %>%
+  filter(family_physician) %>%
+  #select(doc_name, lat, lng) %<%
+ # drop_na(lat, lng) %>%
+#  filter(lng < 0 & lat > 40) %>%
+  sf::st_as_sf(coords = c("lng", "lat"), crs = "WGS84", remove = FALSE) %>%
+    sf::st_transform(crs = 32189) %>%
+  rename(lon = lng)
+
+ons_shp <- onsr::get_ons_shp() %>%
+  sf::st_transform(crs = 32189)
+
+
+# create a shapefile that's a 50km buffer around ottawa
+ott_buffer <- ons_shp %>%
+  sf::st_union() %>%
+  sf::st_buffer(50000) %>%
+  sf::st_as_sf()
+
+# create a shapefile that contains each neighbourhood expanded by a 50m buffer
+ons_buffer_50m <- ons_shp %>%
+  sf::st_buffer(50) %>%
+  sf::st_as_sf()
+
+# pull ONS data from the server
+ons_data <- onsr::get_ons_data()
+
+# get population of each neighbourhood
+nbhd_pop2016 <- ons_data %>%
+  filter(polygon_attribute == "pop2016") %>%
+  select(ONS_ID, 
+         pop2016 = value) %>%
+  mutate(ONS_ID = as.numeric(ONS_ID))
+```
+
+
+## Metric 1: \#FPs in each neighbourhood
+
+* **polygon_attribute:** D_phy_man_count
+
+```{r}
+
+# ONS polygon_attribute is "D_phy_man_count"
+fps_per_nbhd <- onsr::get_pts_neighbourhood(pts = ottawa_docs, pgon = ons_shp) %>%
+  sf::st_set_geometry(NULL) %>%
+  dplyr::group_by(ONS_ID) %>%
+  dplyr::summarise(num_fps = n()) %>%
+  onsr::add_back_nbhds(var = "num_fps") %>%
+  arrange(ONS_ID)
+
+# put the new data in a tibble called new_data
+new_data <- fps_per_nbhd %>%
+  select(ONS_ID, D_phy_man_count = num_fps)
+
+fps_per_nbhd 
+
+
+```
+
+## Metric 2: \# FPs / 1000 residents in the neighbourhood plus a 50m buffer
+
+* **polygon_attribute:** D_phy_man_countPB
+
+```{r}
+
+# get last time's data for comparison
+last_time <- ons_data %>%
+  filter(polygon_attribute == "D_phy_man_countPB") %>%
+  select(ONS_ID, last_time = value) %>%
+  mutate(ONS_ID = as.numeric(ONS_ID))
+
+
+# get # of physicians in each neighbourhood plus a 50m buffer
+fps_per_nbhd_50m_buffer <- onsr::get_pts_neighbourhood(pts = ottawa_docs, pgon = ons_buffer_50m) %>%
+  sf::st_set_geometry(NULL) %>%
+  dplyr::group_by(ONS_ID, Name) %>%
+  dplyr::summarise(num_fps = n()) %>%
+  onsr::add_back_nbhds(var = "num_fps") %>%
+  arrange(ONS_ID)
+
+# create new data with comparison for inspection
+fps_with_buffer <- left_join(fps_per_nbhd_50m_buffer,
+          nbhd_pop2016,
+          by = "ONS_ID") %>%
+  mutate(fps_per_1000_pop = (num_fps / pop2016) * 1000) %>%
+  left_join(last_time) %>%
+  mutate(chg = (fps_per_1000_pop / last_time) - 1)
+
+# add the new data to the new_data tibble, setting the column name to match the ONS polygon_attribute
+new_data <- fps_with_buffer %>%
+  select(ONS_ID, 
+         D_phy_man_countPB = fps_per_1000_pop) %>%
+  right_join(new_data, by = "ONS_ID")
+
+new_data
+
+```
+
+## Average driving time to 5 nearest FPs (measured from DBs and population-weighted up to the neighbourhood level)
+
+**NOTE!** Last time it was average distance to **3** nearest **clinics**
+
+* polygon_attribute: **D_phy_clinic_ave_dis3**
+
+Calculate the drive time and distance from each DB to each physician:
+
+```{r eval=FALSE}
+# NB two DBs don't give drive times to any physicians. unsure why.
+# > drive_table %>% filter(is.na(distance)) %>% pull(DBUID) %>% unique()
+# [1] 35060560005 35061608009
+
+ott_db_centroids <- sf::read_sf("../data/shapefiles/ottawa_db_centroids_32189_nodetails.shp")
+
+# set up non-sf tibbles with lat/lon columns for analysis
+ott_db_cen_latlon <- ott_db_centroids %>%
+  sf_to_latlon() 
+
+ottawa_docs_latlon <- ottawa_docs %>%
+  sf::st_set_geometry(NULL) %>%
+  select(cpso, lat, lon)
+
+# run through valhallr.  takes about 45 minutes when the VM has 4 gigs of ram
+tictoc::tic()
+drive_dist <- valhallr::od_table(froms = ott_db_cen_latlon,
+                   from_id_col = "DBUID",
+                   tos = ottawa_docs_latlon,
+                   to_id_col = "cpso",
+                   verbose = TRUE,
+                   costing = "auto",
+                   #batch_size = 5,
+                   hostname = "192.168.2.30")
+tictoc::toc()
+
+write_csv(drive_dist, file= "generated_distance_tables/drive_table.csv")
+
+```
+
+Get population-weighted averages:
+
+```{r message=FALSE, warning=FALSE}
+drive_table <- read_csv("generated_distance_tables/drive_table.csv")
+
+physician_avg_time <- drive_table %>%
+  onsr::ons_pop_weight_dbs() %>%
+  select(ONS_ID,
+         D_phy_ave_drive_time5 = weighted_time_ons)
+
+new_data <- left_join(new_data, physician_avg_time)
+
+new_data
+
+```
+
+
+
+
+## Average walking distance to 5 nearest FPs (measured from dissemination blocks (DBs) and population-weighted up to the neighbourhood level)
+
+Generate the walking distances:
+
+```{r eval=FALSE}
+ott_db_centroids <- sf::read_sf("../data/shapefiles/ottawa_db_centroids_32189_nodetails.shp")
+
+# set up non-sf tibbles with lat/lon columns for analysis
+ott_db_cen_latlon <- ott_db_centroids %>%
+  sf_to_latlon() 
+
+ottawa_docs_latlon <- ottawa_docs %>%
+  sf::st_set_geometry(NULL) %>%
+  select(cpso, lat, lon)
+
+# run through valhallr.  TODO update how much time it takes hwen the VM has 8 gigs of ram
+tictoc::tic()
+walk_dist <- valhallr::od_table(froms = ott_db_cen_latlon,
+                   from_id_col = "DBUID",
+                   tos = ottawa_docs_latlon,
+                   to_id_col = "cpso",
+                   verbose = TRUE,
+                   costing = "pedestrian",
+                   batch_size = 5,
+                   hostname = "192.168.2.30")
+tictoc::toc()
+
+write_csv(drive_dist, file= "generated_distance_tables/walk_table.csv")
+
+```
+
+Get population-weighted averages:
+
+```{r message=FALSE, warning=FALSE}
+walk_dist <- read_csv("generated_distance_tables/walk_table.csv")
+
+physician_avg_dist_walk <- walk_dist %>%
+  onsr::ons_pop_weight_dbs(n_closest = 5) %>%
+  select(ONS_ID,
+         D_phy_ave_walk_dis5 = weighted_dist_ons)
+
+new_data <- left_join(new_data,
+                      physician_avg_dist_walk,
+                      by = "ONS_ID")
+
+new_data
+
+```
+
+
+## % of residents within a 15-minute walk of any FP
+
+* previous polygon_attribute: D_phy_clinic_covPop
+
+```{r}
+
+walk_table <- read_csv("generated_distance_tables/walk_table.csv")
+
+minute_threshold <- 2
+
+# group by DBUID, arrange in increasing order of time, get the top one (shortest),
+# then see if the shortest is under the threshold # of seconds
+pct_walking <- walk_table %>%
+  drop_na() %>%
+  group_by(DBUID) %>%
+  arrange(time) %>%
+  slice_head(n=1) %>%
+  ungroup() %>%
+  mutate(covered = if_else(time < minute_threshold * 60, 1, 0)) %>%
+  #filter(DBUID == 35060560005)
+    select(DBUID, covered) %>%
+
+  left_join(onsr::ottawa_db_pops_2016, by = "DBUID") %>%
+  mutate(DBUID = as.character(DBUID)) %>%
+  left_join(onsr::get_db_to_ons(), by = "DBUID") %>%
+  mutate(covered_pop = covered * db_pop_2016) %>%
+  #filter(ONS_ID == 48)
+  group_by(ONS_ID) %>%
+  summarise(total_pop = sum(db_pop_2016),
+            covered_pop = sum(covered_pop),
+            pct_covered = covered_pop/total_pop) %>%
+  drop_na() %>%
+  select(ONS_ID,
+         D_phy_covPop = pct_covered)
+
+
+new_data <- left_join(new_data,
+                      pct_walking,
+                      by = "ONS_ID")
+
+new_data
+```
+
+
+
+```{r, include= FALSE}
+# a <- ott_db_cen_latlon %>%
+#   filter( DBUID == 35060560005) #%>%  leaflet() %>% addTiles() %>% addMarkers()
+# 
+# 
+# b <- ottawa_docs_latlon %>%
+#   filter(cpso == 112000) #%>%  leaflet() %>% addTiles() %>% addMarkers()
+# 
+# valhallr::route(from = a,
+#                 to = b,
+#                 hostname = "192.168.2.30") %>%
+#   valhallr::map_trip()
+# 
+# valhallr::od_table(froms = a,
+#                    from_id_col = "DBUID",
+#                    tos = b,
+#                    to_id_col = "cpso",
+#                    hostname = "192.168.2.30")
+
+```
+

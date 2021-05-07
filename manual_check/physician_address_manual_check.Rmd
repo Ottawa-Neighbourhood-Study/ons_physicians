@@ -1,0 +1,105 @@
+---
+title: "Physician Locations: Manual Data Validation"
+author: "Christopher Belanger, PhD - Ottawa Neighbourhood Study"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Purpose
+
+This generates an interactive map that makes it easy to look at each identified family physician one by one. It can be used tofind physicians who don't look like they provid family medical services to the general public, e.g. because they work in sports medicine clinics or in government offices, and also to verify that their geolocated addresses all looked correct.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(sf)
+library(leaflet)
+library(viridis)
+library(onsr)
+
+docs_ottawa <- read_csv("../data/docs_fulldata.csv",
+                        col_types = cols(.default = "c")) %>%
+  mutate(lat = as.double(lat),
+         lng = as.double(lng),
+         french = as.logical(french),
+         family_physician = as.logical(family_physician),
+         in_geo_scope = as.logical(in_geo_scope)) %>%
+  filter(in_geo_scope)
+
+
+docs_fp <- docs_ottawa %>%
+  filter(family_physician) %>%
+#  filter(french) %>%
+  drop_na(lat,lng) %>%
+  arrange(desc("lng")) %>%
+  sf::st_as_sf(coords = c("lng","lat"), crs = "WGS84") 
+
+labs_docs <- paste0("Name: ", docs_fp$doc_name, 
+               "<br><br>Primary Practice Location:<br> ",docs_fp$primary_location  %>% str_replace_all("\\n", "<br>"),
+               "<br><br>Specialization:<br>", docs_fp$specialties %>% str_replace_all("\\n", "<br>")) %>% purrr::map(htmltools::HTML)
+
+
+```
+
+
+## Instructions
+
+You'll use this html document and the file the file `ottawa_fps_for_check.csv`. 
+
+* **First,** please rename the file to `ottawa_fps_for_check_YOURNAME.csv` (using your own name, obviously) and make sure you can open it in Excel.
+* **Then,** please review all physicians on the map below to make sure the data is correct, including:
+  * Their marker is in the right place (i.e. the pin matches the address), and
+  * They provide family medicine services to the general public. 
+
+If you find one that looks like it's in the wrong place or shouldn't be on the list, make a note in the `notes` column in the file `ottawa_fps_for_check.csv`. Make sure to save often :)
+
+We specifically want to exclude physicians who work in places like:
+
+* Hospitals,
+* Sports medicine clinics,
+* Pain clinics,
+* The government, 
+* Or anywhere like that. *If in doubt, make a note and we will review later.*
+
+You can do this pretty quickly by clicking on the first number and then pressing "down" to move through the physicians, and hovering your mouse over their location marker to see the information. You can zoom in and out using the mouse scroll wheel. You can also use Google to look up what a specific physician or clinic does if it's not clear from the name.
+
+
+```{r}
+# save filtered docs to csv
+docs_fp %>%
+  rowid_to_column() %>%
+  sf::st_set_geometry(NULL) %>%
+  select(rowid, doc_name, primary_location) %>%
+  write_csv("ottawa_fps_for_check.csv")
+```
+
+
+## Interactive Map
+
+```{r, out.width = "12in", out.height = "8in", warning = FALSE}
+# https://rstudio.github.io/leaflet/showhide.html
+
+
+docmap <- leaflet(width="100%") %>%
+  addTiles()
+
+for (i in 1:nrow(docs_fp)){
+  doc <- docs_fp[i,] %>%
+    mutate(address = stringr::str_replace_all(address, "\\n", "<br>"))
+  docmap <- docmap %>%
+    addMarkers(data = doc, group = as.character(i),
+               label = htmltools::HTML(paste0("Name: ", doc$doc_name, 
+               "<br><br>Location:<br> ",doc$address)),
+               popup = htmltools::HTML(paste0("Name: ", doc$doc_name, 
+               "<br><br>Location:<br> ",doc$address)),
+               popupOptions = popupOptions(autoPan = TRUE,
+                                           zoomAnimation = TRUE,
+                                           ))
+}
+
+docmap %>%
+  addLayersControl(baseGroups = as.character(1:nrow(docs_fp)),
+                   options = layersControlOptions(collapsed = FALSE))
+
+
+```
