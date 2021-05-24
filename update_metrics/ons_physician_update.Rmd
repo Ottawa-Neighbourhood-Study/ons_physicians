@@ -21,25 +21,25 @@ knitr::opts_chunk$set(echo = TRUE)#, message = FALSE, warning = FALSE)
 ########
 # function to take class sf shapefile/simple feature geometric object and
 # convert it to a tibble with lat and lon columns for valhallr
-sf_to_latlon <- function(data, output_crs = "WGS84"){
-  # input validation: make sure it's an sf object
-  if (!"sf" %in% class(data)) stop ("Input data is not a simple feature object with class sf.")
-  # make sure it doesn't already have lat/lon columns
-  if (("lat" %in% colnames(data)) | "lon" %in% colnames(data)) stop ("Input data already has columns named `lat` and/or `lon`.")
-  # make sure it's all point data
-  if (!(unique(sf::st_geometry_type(data)) == "POINT")) stop ("Input data is not exclusively point data.")
-  
-  .coords <- data %>%
-    sf::st_transform(crs = output_crs) %>%
-    sf::st_coordinates() %>%
-    tibble::as_tibble() %>%
-    dplyr::rename(lon = X, lat = Y)
-  
-  data %>%
-    sf::st_set_geometry(NULL) %>%
-    dplyr::bind_cols(.coords)
-  
-}
+# sf_to_latlon <- function(data, output_crs = "WGS84"){
+#   # input validation: make sure it's an sf object
+#   if (!"sf" %in% class(data)) stop ("Input data is not a simple feature object with class sf.")
+#   # make sure it doesn't already have lat/lon columns
+#   if (("lat" %in% colnames(data)) | "lon" %in% colnames(data)) stop ("Input data already has columns named `lat` and/or `lon`.")
+#   # make sure it's all point data
+#   if (!(unique(sf::st_geometry_type(data)) == "POINT")) stop ("Input data is not exclusively point data.")
+#   
+#   .coords <- data %>%
+#     sf::st_transform(crs = output_crs) %>%
+#     sf::st_coordinates() %>%
+#     tibble::as_tibble() %>%
+#     dplyr::rename(lon = X, lat = Y)
+#   
+#   data %>%
+#     sf::st_set_geometry(NULL) %>%
+#     dplyr::bind_cols(.coords)
+#   
+# }
 ```
 
 ## Purpose
@@ -52,13 +52,47 @@ This RMarkdown file includes code and instructions for calculating five Ottawa N
 * Average driving time to 5 nearest FPs (measured from DBs and population-weighted up to the neighbourhood level)
 * % of residents within a 15-minute walk of any FP
 
+## Prerequisites
+
+The GitHub repository includes all data needed to run this code, **but** it uses the Valhalla routing engine for finding travel distances and times for accessibility metrics.
+
+## Data pre-processing
+
+This file uses data that has already been pre-processed: first we scraped it from the CPSO, then we came up with a semi-automated process for finding probable community-based family physicians, then we had summer students check that list (n=1,009) by hand, and _then_ we made some final edits by hand to fix incorrect geocoding, and now that's the data we're working with.
+
+Each intermediary dataset is saved, adn this (non-running) code chunk shows the relation between them:
+
+```{r, warning = FALSE, message = FALSE, eval=FALSE}
+
+# load CPSO-scraped data
+docs_raw <- read_csv("../data/docs_fulldata.csv") %>%
+  filter(family_physician)
+
+# load hand-checked data that students verified
+docs_handchecked <- readxl::read_xlsx("../data/Final_physicians.xlsx") %>%
+  select(-rowid, -primary_location)
+
+
+docs_semifinal <- left_join(docs_raw, docs_handchecked, by = "doc_name") %>%
+  filter (katie_decision > 0) %>%
+  write_csv("../data/docs_semifinal.csv")
+
+# then adjust docs_semifinal.csv by hand to create docs_final.csv
+```
+
+From this point on the process is code-based and repeatable.
 
 ## Loading the data
 
-NOTE: Right now we're using data that is still being validated by summer students. We'll need to re-run these calculations once we have the confirmed data.
+First, we load the data. There are two main sources:
 
-```{r, warning = FALSE, message = FALSE}
-ottawa_docs <- read_csv("../data/docs_fulldata.csv") %>%
+* **Physician Data** that's been pre-processed and hand verified.
+* **ONS data**, including the neighbourhood geometries and all the neighbourhood data.
+
+
+```{r load_data}
+
+ottawa_docs <- read_csv("../data/docs_final.csv") %>%
   filter(family_physician) %>%
   #select(doc_name, lat, lng) %<%
  # drop_na(lat, lng) %>%
@@ -156,7 +190,7 @@ new_data
 
 ```
 
-## Average driving time to 5 nearest FPs (measured from DBs and population-weighted up to the neighbourhood level)
+## Metric 3: Average driving time to 5 nearest FPs (measured from DBs and population-weighted up to the neighbourhood level)
 
 **NOTE!** Last time it was average distance to **3** nearest **clinics**
 
@@ -168,6 +202,14 @@ Calculate the drive time and distance from each DB to each physician:
 # NB two DBs don't give drive times to any physicians. unsure why.
 # > drive_table %>% filter(is.na(distance)) %>% pull(DBUID) %>% unique()
 # [1] 35060560005 35061608009
+# ott_dbs <- sf::read_sf("../../../large_shapefiles/ldb_000b16a_e/ldb_000b16a_e.shp")
+# ott_dbs %>%
+#   filter(CDUID == 3506) %>%
+#   filter(DBUID == 35060209001) %>%
+#   sf::st_transform(crs = "WGS84") %>%
+#   leaflet() %>%
+#   addTiles() %>%
+#   addPolygons()
 
 ott_db_centroids <- sf::read_sf("../data/shapefiles/ottawa_db_centroids_32189_nodetails.shp")
 
@@ -214,7 +256,7 @@ new_data
 
 
 
-## Average walking distance to 5 nearest FPs (measured from dissemination blocks (DBs) and population-weighted up to the neighbourhood level)
+## Metric 4: Average walking distance to 5 nearest FPs (measured from dissemination blocks (DBs) and population-weighted up to the neighbourhood level)
 
 Generate the walking distances:
 
@@ -241,16 +283,16 @@ walk_dist <- valhallr::od_table(froms = ott_db_cen_latlon,
                    hostname = "192.168.2.30")
 tictoc::toc()
 
-write_csv(drive_dist, file= "generated_distance_tables/walk_table.csv")
+write_csv(walk_dist, file= "generated_distance_tables/walk_table.csv")
 
 ```
 
 Get population-weighted averages:
 
 ```{r message=FALSE, warning=FALSE}
-walk_dist <- read_csv("generated_distance_tables/walk_table.csv")
+walk_table <- read_csv("generated_distance_tables/walk_table.csv")
 
-physician_avg_dist_walk <- walk_dist %>%
+physician_avg_dist_walk <- walk_table %>%
   onsr::ons_pop_weight_dbs(n_closest = 5) %>%
   select(ONS_ID,
          D_phy_ave_walk_dis5 = weighted_dist_ons)
@@ -264,7 +306,7 @@ new_data
 ```
 
 
-## % of residents within a 15-minute walk of any FP
+## Metric 5: % of residents within a 15-minute walk of any FP
 
 * previous polygon_attribute: D_phy_clinic_covPop
 
@@ -272,7 +314,7 @@ new_data
 
 walk_table <- read_csv("generated_distance_tables/walk_table.csv")
 
-minute_threshold <- 2
+minute_threshold <- 15
 
 # group by DBUID, arrange in increasing order of time, get the top one (shortest),
 # then see if the shortest is under the threshold # of seconds
@@ -307,6 +349,11 @@ new_data <- left_join(new_data,
 new_data
 ```
 
+
+
+```{r}
+write_csv(new_data, "../outputs/new_data.csv")
+```
 
 
 ```{r, include= FALSE}
